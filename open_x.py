@@ -5,63 +5,36 @@
 # ///
 """CLI tool to scrape X post text using your existing logged-in Firefox session."""
 
-import glob
-import os
-import shutil
-import sqlite3
 import sys
-import tempfile
-from pathlib import Path
 from typing import Literal, cast
 
 from playwright._impl._api_structures import SetCookieParam  # type: ignore[import]
 from playwright.sync_api import sync_playwright
 
-
-FIREFOX_PROFILES_DIR = Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles"
+from firefox_cookies import find_firefox_profile, load_firefox_cookies
 
 SameSiteValue = Literal["None", "Lax", "Strict"]
 SAME_SITE_MAP: dict[int, SameSiteValue] = {0: "None", 1: "Lax", 2: "Strict"}
 
 
-def find_firefox_profile() -> Path:
-    matches = glob.glob(str(FIREFOX_PROFILES_DIR / "*.default-release"))
-    if not matches:
-        matches = glob.glob(str(FIREFOX_PROFILES_DIR / "*.default"))
-    if not matches:
-        print("Error: No Firefox profile found.", file=sys.stderr)
-        sys.exit(1)
-    return Path(matches[0])
-
-
-def extract_x_cookies(profile_path: Path) -> list[SetCookieParam]:
-    """Copy cookies.sqlite to a temp file (avoids lock conflicts) and read x.com cookies."""
-    cookies_db = profile_path / "cookies.sqlite"
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".sqlite")
-    os.close(tmp_fd)
-    try:
-        shutil.copy2(str(cookies_db), tmp_path)
-        conn = sqlite3.connect(tmp_path)
-        cursor = conn.execute(
-            "SELECT name, value, host, path, expiry, isSecure, isHttpOnly, sameSite "
-            "FROM moz_cookies "
-            "WHERE host LIKE '%x.com' OR host LIKE '%twitter.com'"
-        )
-        cookies: list[SetCookieParam] = []
-        for name, value, host, path, expiry, is_secure, is_http_only, same_site in cursor:
-            cookies.append({
-                "name": name,
-                "value": value,
-                "domain": host,
-                "path": path,
-                "expires": float(expiry) / 1000 if expiry > 0 else -1,
-                "secure": bool(is_secure),
-                "httpOnly": bool(is_http_only),
-                "sameSite": cast(SameSiteValue, SAME_SITE_MAP.get(same_site, "None")),
-            })
-        conn.close()
-    finally:
-        os.unlink(tmp_path)
+def extract_x_cookies(profile_path) -> list[SetCookieParam]:
+    """Load Firefox cookies for x.com/twitter.com and adapt them for Playwright."""
+    raw_cookies = load_firefox_cookies(
+        profile_path, lambda host: "x.com" in host or "twitter.com" in host
+    )
+    cookies: list[SetCookieParam] = []
+    for cookie in raw_cookies:
+        same_site = SAME_SITE_MAP.get(cookie.same_site or 0, "None")
+        cookies.append({
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.host,
+            "path": cookie.path,
+            "expires": float(cookie.expiry) / 1000 if cookie.expiry > 0 else -1,
+            "secure": cookie.is_secure,
+            "httpOnly": cookie.is_http_only,
+            "sameSite": cast(SameSiteValue, same_site),
+        })
     return cookies
 
 
@@ -82,7 +55,11 @@ def main() -> None:
         print("Example: uv run open_x.py https://x.com/user/status/123456789")
         sys.exit(1)
 
-    profile_path = find_firefox_profile()
+    try:
+        profile_path = find_firefox_profile()
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     print(f"Using Firefox profile: {profile_path}")
 
     cookies = extract_x_cookies(profile_path)

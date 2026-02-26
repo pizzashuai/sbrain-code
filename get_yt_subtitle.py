@@ -7,16 +7,28 @@
 
 from __future__ import annotations
 
+import argparse
 import html
 import re
 import sys
-from typing import Optional
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from typing import Iterator, Optional
 
 import requests
 import yt_dlp  # type: ignore[import]
 
+from firefox_cookies import firefox_cookie_jar, find_firefox_profile
+
 
 _TIMECODE_RE = re.compile(r"\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}")
+_YOUTUBE_COOKIE_SUFFIXES = (
+    ".youtube.com",
+    ".youtube-nocookie.com",
+    ".google.com",
+    ".youtube.googleapis.com",
+    ".googleusercontent.com",
+)
 
 
 def _strip_subtitle_markup(raw: str) -> str:
@@ -91,42 +103,69 @@ def _strip_subtitle_markup(raw: str) -> str:
     return " ".join(lines).strip()
 
 
-def fetch_subtitle_text(video_url: str, lang: str = "en") -> tuple[str, str]:
+def _extract_subtitle_url(info: dict[str, object], lang: str) -> tuple[Optional[str], Optional[str]]:
+    """Return the best subtitle URL plus the language actually used."""
+    def pick_candidate(tracks: dict) -> Optional[str]:
+        lang_tracks = tracks.get(lang)
+        if isinstance(lang_tracks, list) and lang_tracks:
+            candidate = lang_tracks[-1]
+            if isinstance(candidate, dict) and "url" in candidate:
+                return str(candidate["url"])
+        return None
+
+    def pick_first_available(tracks: dict) -> tuple[Optional[str], Optional[str]]:
+        for track_lang, lang_tracks in tracks.items():
+            if isinstance(lang_tracks, list) and lang_tracks:
+                candidate = lang_tracks[-1]
+                if isinstance(candidate, dict) and "url" in candidate:
+                    return str(candidate["url"]), str(track_lang)
+        return None, None
+
+    for field in ("subtitles", "automatic_captions"):
+        tracks = info.get(field)
+        if isinstance(tracks, dict):
+            url = pick_candidate(tracks)
+            if url:
+                return url, lang
+
+    for field in ("subtitles", "automatic_captions"):
+        tracks = info.get(field)
+        if isinstance(tracks, dict):
+            url, detected_lang = pick_first_available(tracks)
+            if url:
+                return url, detected_lang
+
+    return None, None
+
+
+def fetch_subtitle_text(
+    video_url: str, lang: str = "en", cookiefile: str | Path | None = None
+) -> tuple[str, str]:
     """Return (title, plain_subtitle_text) for the given YouTube URL.
 
     Prefers manually uploaded subtitles, with automatic captions as a fallback.
     """
     ydl_opts: dict[str, object] = {
         "skip_download": True,
+        "ignore_no_formats_error": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitleslangs": [lang],
         # Ask yt-dlp for a consistent text-based format (still includes timestamps).
         "subtitlesformat": "vtt",
     }
+    if cookiefile:
+        ydl_opts["cookiefile"] = str(cookiefile)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
 
     title = str(info.get("title") or "").strip()
 
-    subtitle_url: Optional[str] = None
-
-    # Prefer human-made subtitles, then fall back to auto captions.
-    for field in ("subtitles", "automatic_captions"):
-        tracks = info.get(field) or {}
-        if not isinstance(tracks, dict):
-            continue
-        lang_tracks = tracks.get(lang)
-        if isinstance(lang_tracks, list) and lang_tracks:
-            # Pick the last format entry (often the best or vtt).
-            candidate = lang_tracks[-1]
-            if isinstance(candidate, dict) and "url" in candidate:
-                subtitle_url = str(candidate["url"])
-                break
+    subtitle_url, _ = _extract_subtitle_url(info, lang)
 
     if not subtitle_url:
-        raise RuntimeError(f"No subtitles found for language '{lang}'")
+        raise RuntimeError(f"No subtitles found (requested '{lang}' but none were available).")
 
     resp = requests.get(subtitle_url, timeout=30)
     resp.raise_for_status()
@@ -134,21 +173,50 @@ def fetch_subtitle_text(video_url: str, lang: str = "en") -> tuple[str, str]:
     return title, text
 
 
+def _youtube_host_predicate(host: str) -> bool:
+    clean_host = host.lstrip(".").lower()
+    return any(clean_host.endswith(suffix.lstrip(".")) for suffix in _YOUTUBE_COOKIE_SUFFIXES)
+
+
+@contextmanager
+def youtube_cookiefile_from_firefox(profile: str | None = None) -> Iterator[Path]:
+    profile_path = find_firefox_profile(profile)
+    with firefox_cookie_jar(_youtube_host_predicate, profile_path) as cookie_file:
+        yield cookie_file
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch and clean YouTube subtitles.")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default="https://www.youtube.com/watch?v=akM6P97_0B8&t=1s",
+        help="YouTube URL (defaults to a sample video).",
+    )
+    parser.add_argument(
+        "--use-firefox-cookies",
+        action="store_true",
+        help="Load cookies from the default Firefox profile to access members-only videos.",
+    )
+    parser.add_argument(
+        "--firefox-profile",
+        help="Optional explicit Firefox profile directory to use for cookies.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Test helper by fetching subtitles for a single URL."""
-    if len(sys.argv) > 2:
-        print("Usage: uv run get_yt_subtitle.py [youtube_url]", file=sys.stderr)
-        sys.exit(1)
+    args = parse_args()
+    if args.use_firefox_cookies:
+        cm = youtube_cookiefile_from_firefox(args.firefox_profile)
+    else:
+        cm = nullcontext(None)
 
-    video_url = (
-        sys.argv[1]
-        if len(sys.argv) == 2
-        else "https://www.youtube.com/watch?v=akM6P97_0B8&t=1s"
-    )
-
-    print(f"Fetching subtitles for: {video_url}")
+    print(f"Fetching subtitles for: {args.url}")
     try:
-        title, text = fetch_subtitle_text(video_url, lang="en")
+        with cm as cookiefile:
+            title, text = fetch_subtitle_text(args.url, lang="en", cookiefile=cookiefile)
     except Exception as exc:  # pragma: no cover - simple CLI
         print(f"Error fetching subtitles: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -163,4 +231,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
